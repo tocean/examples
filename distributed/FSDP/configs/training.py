@@ -14,5 +14,5 @@ class train_config:
     weight_decay: float=0.0
     gamma: float= 0.85
     use_fp16: bool=False
-    mixed_precision: bool=False
+    mixed_precision: bool=True
     save_model: bool=False
