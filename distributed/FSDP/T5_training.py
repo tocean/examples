@@ -79,7 +79,10 @@ def fsdp_main(args):
     local_rank = int(os.environ['LOCAL_RANK'])
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
-
+    
+    if rank == 0:
+        total_params = sum([p.numel() for p in model.parameters()])
+        print(f'total params: {total_params/1e6}M')
 
     dataset = load_dataset('wikihow', 'all', data_dir='data/')
     print(dataset.keys())
@@ -112,21 +115,39 @@ def fsdp_main(args):
     
     # Set up FSDP parameters
     mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
-    
     # Apply FSDP wrapping to the model
-    model = FSDP(model,
-        auto_wrap_policy=t5_auto_wrap_policy,
-        mixed_precision=mixed_precision_policy,
-        sharding_strategy=fsdp_config.sharding_strategy,
-        device_id=torch.cuda.current_device(),
-        limit_all_gathers=fsdp_config.limit_all_gathers)
+    if args.msamp:
+        from msamp.fsdp import FsdpReplacer
+        from msamp.fsdp import FP8FullyShardedDataParallel
+        model = model.to(torch.cuda.current_device())
+        model = FsdpReplacer.replace(model)
+
+        model = FP8FullyShardedDataParallel(model, 
+                                            auto_wrap_policy=t5_auto_wrap_policy, 
+                                            mixed_precision=None,
+                                            device_id=torch.cuda.current_device(),
+                                            use_orig_params=True, 
+                                            limit_all_gathers=fsdp_config.limit_all_gathers)
+        if rank == 0:
+            print(f'model: {model}')
+    else:
+        model = FSDP(model,
+            auto_wrap_policy=t5_auto_wrap_policy,
+            mixed_precision=mixed_precision_policy,
+            sharding_strategy=fsdp_config.sharding_strategy,
+            device_id=torch.cuda.current_device(),
+            limit_all_gathers=fsdp_config.limit_all_gathers)
     
     if fsdp_config.fsdp_activation_checkpointing:
         policies.apply_fsdp_checkpointing(model)
 
     # Set up optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
-
+    if args.msamp:
+        from msamp.optim import FSDPAdamW
+        optimizer = FSDPAdamW(model.parameters(), lr=train_config.lr)
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
+    
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
     best_val_loss = float("inf")
     curr_val_loss = float("inf")
@@ -164,6 +185,9 @@ def fsdp_main(args):
                 mem_alloc_tracker.append(
                     format_metrics_to_gb(torch.cuda.memory_allocated())
                 )
+                if dist.get_rank() == 0:
+                    print(f'mem allocated: {torch.cuda.max_memory_allocated()/1e9} GB')
+
                 mem_reserved_tracker.append(
                     format_metrics_to_gb(torch.cuda.memory_reserved())
                 )
@@ -200,7 +224,7 @@ if __name__ == '__main__':
                         help='input batch size for training (default: 64)')
     parser.add_argument('--test-batch-size', type=int, default=4, metavar='N',
                         help='input batch size for testing (default: 1000)')
-    parser.add_argument('--epochs', type=int, default=2, metavar='N',
+    parser.add_argument('--epochs', type=int, default=1, metavar='N',
                         help='number of epochs to train (default: 3)')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
@@ -208,6 +232,8 @@ if __name__ == '__main__':
                         help='track the gpu memory')
     parser.add_argument('--run_validation', action='store_false', default=True,
                         help='running the validation')
+    parser.add_argument('--msamp', action='store_true', default=False, help='whether use MS-AMP')
+
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
